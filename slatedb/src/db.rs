@@ -588,6 +588,57 @@ pub struct Db {
 }
 
 impl Db {
+    /// Returns the current size of unflushed in-memory state in bytes.
+    ///
+    /// This is the same value SlateDB uses internally to gate
+    /// `maybe_apply_backpressure`: the sum of WAL buffer + immutable
+    /// memtables awaiting flush. The active memtable is intentionally
+    /// excluded (matching the internal check) to avoid taking a write lock.
+    ///
+    /// When this value approaches [`Settings::max_unflushed_bytes`], the
+    /// next write will trigger SlateDB's backpressure path and block the
+    /// writer thread inside [`Db::put`]. Embedders that want to enforce
+    /// upstream admission control — i.e. reject incoming writes at the
+    /// application layer before SlateDB has to block — can poll this
+    /// accessor and shed load when it crosses a watermark.
+    ///
+    /// ## Returns
+    /// - `Ok(bytes)`: current WAL buffer + immutable memtable byte count
+    /// - `Err(Error)`: if the WAL buffer's size estimate fails (rare)
+    ///
+    /// ## Example
+    ///
+    /// ```no_run
+    /// use slatedb::{Db, Error};
+    /// # async fn example(db: &Db) -> Result<(), Error> {
+    /// const WATERMARK: usize = 800 * 1024 * 1024; // 800 MB
+    /// if db.unflushed_bytes()? > WATERMARK {
+    ///     // Reject incoming request with a retriable error instead of
+    ///     // calling Db::put, which would block on backpressure.
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn unflushed_bytes(&self) -> Result<usize, crate::Error> {
+        let wal_size_bytes = self.inner.wal_buffer.estimated_bytes()?;
+        let imm_memtable_size_bytes = {
+            let guard = self.inner.state.read();
+            guard
+                .state()
+                .imm_memtable
+                .iter()
+                .map(|imm| {
+                    let metadata = imm.table().metadata();
+                    self.inner.table_store.estimate_encoded_size_compacted(
+                        metadata.entry_num,
+                        metadata.entries_size_in_bytes,
+                    )
+                })
+                .sum::<usize>()
+        };
+        Ok(wal_size_bytes + imm_memtable_size_bytes)
+    }
+
     /// Open a new database with default options.
     ///
     /// ## Arguments

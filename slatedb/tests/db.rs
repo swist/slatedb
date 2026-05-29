@@ -272,3 +272,41 @@ async fn test_concurrent_writers_and_readers() {
         .await
         .expect("Failed to close DB after retries");
 }
+
+/// Verifies the public `Db::unflushed_bytes()` accessor.
+///
+/// The accessor returns the same value SlateDB's own `maybe_apply_backpressure`
+/// uses to gate writes: WAL buffer + immutable memtables (active memtable
+/// excluded). This is useful for embedders that want to enforce upstream
+/// admission control before SlateDB has to block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_unflushed_bytes_starts_at_zero_and_callable() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db = Db::open("test_unflushed", store)
+        .await
+        .expect("open db");
+
+    // Fresh DB: nothing written → no unflushed bytes.
+    let initial = db.unflushed_bytes().expect("unflushed_bytes call");
+    assert_eq!(initial, 0, "fresh db should report 0 unflushed bytes, got {initial}");
+
+    // Drive enough writes to push past the active memtable into the
+    // WAL buffer / imm_memtable. The accessor excludes the active memtable
+    // (matching maybe_apply_backpressure's internal behaviour) so we need
+    // multiple sustained writes.
+    for i in 0..200 {
+        let key = format!("key-{:04}", i);
+        let value = vec![b'x'; 1024];
+        db.put(key.as_bytes(), &value)
+            .await
+            .expect("put");
+    }
+
+    // After writes, unflushed_bytes is "best effort" — SlateDB may have already
+    // flushed everything if the flush interval is short. Assert only that the
+    // call succeeds without panic. (A stronger assertion would require a
+    // controlled clock, which is out of scope for this smoke test.)
+    let _ = db.unflushed_bytes().expect("unflushed_bytes call after writes");
+
+    db.close().await.expect("close");
+}
